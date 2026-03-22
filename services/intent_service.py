@@ -796,6 +796,54 @@ class IntentService:
         # All required fields present - show confirmation
         return self._show_smart_capture_confirmation(user_id, extracted)
 
+    def _handle_invoice_month_reply(self, user_id: str, message: str, user_mem: dict, data_user_id: str, conversation_history: list) -> Dict:
+        """Handle user providing a month after bot asked 'Which month?' for invoice."""
+        from datetime import datetime
+        # Clear the awaiting state
+        client_name = user_mem.get("pending_invoice_client", "")
+        send_email = user_mem.get("pending_invoice_send_email", False)
+        self.memory.update_user_memory(user_id, {
+            "awaiting_invoice_month": False,
+            "pending_invoice_client": None,
+            "pending_invoice_send_email": None,
+        })
+
+        # Extract month from user reply
+        month_name = None
+        msg_lower = message.strip().lower()
+        _MONTHS = {
+            "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+            "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+            "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        month_num = None
+        for name, num in _MONTHS.items():
+            if name in msg_lower:
+                month_name = name.capitalize()
+                month_num = num
+                break
+
+        if not month_num:
+            response = f"I couldn't detect a month from your reply. Please say something like: 'March' or 'For April'."
+            self._store_conversation(user_id, message, response)
+            # Re-set awaiting state
+            self.memory.update_user_memory(user_id, {
+                "awaiting_invoice_month": True,
+                "pending_invoice_client": client_name,
+                "pending_invoice_send_email": send_email,
+            })
+            return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
+
+        year_val = datetime.now().year
+        # Reconstruct full invoice message and route through invoice logic
+        synthetic_msg = f"Generate invoice for {client_name} for {month_name}"
+        if send_email:
+            synthetic_msg = f"Send invoice for {client_name} for {month_name} over email"
+        logger.info(f"[INVOICE_FOLLOWUP] Resuming invoice flow: client={client_name}, month={month_name}, synthetic='{synthetic_msg}'")
+        # Re-enter process_request with the full synthetic message
+        return self.process_request(user_id=user_id, message=synthetic_msg)
+
     def _handle_poc_email_response(self, user_id: str, message: str) -> Dict:
         """Handle user providing a client POC email after invoice generation."""
         import re
@@ -1318,6 +1366,10 @@ class IntentService:
             if is_add_job or is_plus:
                 return self._start_smart_capture(user_id, message)
 
+            # 0b1.4. Check if user is providing the month for a pending invoice
+            if user_mem.get("awaiting_invoice_month"):
+                return self._handle_invoice_month_reply(user_id, message, user_mem, data_user_id, conversation_history)
+
             # 0b1.5. Check if user is providing a client POC email
             if user_mem.get("awaiting_poc_email"):
                 return self._handle_poc_email_response(user_id, message)
@@ -1512,6 +1564,36 @@ class IntentService:
                         from datetime import datetime
                         year_val = datetime.now().year
 
+                    # Fuzzy-match client_name against actual DB clients
+                    # (Gemini often normalizes names, e.g. "Bridgestone12" → "Bridgestone")
+                    if client_name:
+                        safe_uid = data_user_id.replace("'", "''")
+                        clients_sql = (
+                            f"SELECT DISTINCT client_name FROM public.job_entries "
+                            f"WHERE user_id = '{safe_uid}' AND client_name IS NOT NULL AND (\"isDeleted\" IS NOT TRUE)"
+                        )
+                        clients_result = self.supabase.execute_sql(clients_sql)
+                        if clients_result.get("ok"):
+                            db_clients = [r["client_name"] for r in (clients_result.get("rows") or []) if r.get("client_name")]
+                            # Exact match first
+                            exact = [c for c in db_clients if c.lower() == client_name.lower()]
+                            if exact:
+                                client_name = exact[0]
+                            else:
+                                # Partial match: DB client contains extracted name or vice versa
+                                partial = [c for c in db_clients if client_name.lower() in c.lower() or c.lower() in client_name.lower()]
+                                if len(partial) == 1:
+                                    logger.info(f"[INVOICE] Fuzzy matched '{client_name}' → '{partial[0]}'")
+                                    client_name = partial[0]
+                                elif len(partial) > 1:
+                                    # Multiple partial matches — check the original message for the best one
+                                    msg_low = message.lower()
+                                    for p in partial:
+                                        if p.lower() in msg_low:
+                                            logger.info(f"[INVOICE] Matched '{client_name}' → '{p}' from message text")
+                                            client_name = p
+                                            break
+
                     # Resolve "this job" / missing client from last saved job context
                     if not client_name and not bill_number:
                         last_job = user_mem.get("last_saved_job")
@@ -1533,12 +1615,20 @@ class IntentService:
                         self._store_conversation(user_id, message, response)
                         return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
                     if client_name and not month_num and not bill_number:
+                        # Check if user explicitly asked to send via email
+                        send_email = "email" in msg_lower or "e-mail" in msg_lower
                         months_result = self.supabase.get_available_months_for_client(client_name, user_id=data_user_id)
                         if months_result.get("ok") and months_result.get("months"):
                             month_options = "\n".join(f"• {m['label']}" for m in months_result["months"])
                             response = f"I see you want an invoice for {client_name}. Which month?\n\n{month_options}\n\nReply with the month, e.g. 'Send invoice for {client_name} for March 2025'."
                         else:
                             response = f"I see you want an invoice for {client_name}. Which month? For example: 'Send invoice for {client_name} for March'."
+                        # Set awaiting state so the next reply routes to invoice month handler
+                        self.memory.update_user_memory(user_id, {
+                            "awaiting_invoice_month": True,
+                            "pending_invoice_client": client_name,
+                            "pending_invoice_send_email": send_email,
+                        })
                         self._store_conversation(user_id, message, response)
                         return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
 
@@ -1552,10 +1642,27 @@ class IntentService:
                         return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
                     rows = result.get("rows") or []
                     if not rows:
+                        # Check what months actually have data for this client
+                        hint = ""
+                        if client_name:
+                            safe_client = client_name.replace("'", "''")
+                            safe_uid = data_user_id.replace("'", "''")
+                            avail_sql = (
+                                f"SELECT DISTINCT TO_CHAR(job_date, 'Month YYYY') AS period "
+                                f"FROM public.job_entries "
+                                f"WHERE user_id = '{safe_uid}' AND client_name ILIKE '%{safe_client}%' "
+                                f"AND job_date IS NOT NULL AND (\"isDeleted\" IS NOT TRUE) ORDER BY period"
+                            )
+                            avail = self.supabase.execute_sql(avail_sql)
+                            periods = [r["period"].strip() for r in (avail.get("rows") or [])]
+                            if periods:
+                                hint = f"\n\nI do have records for {client_name} in: {', '.join(periods)}."
+                            else:
+                                hint = f"\n\nI don't have any records for {client_name} at all."
                         if client_name and month_num:
-                            response = f"I found no invoice for {client_name} for {month_name or month_num} {year_val}."
+                            response = f"I found no jobs for {client_name} in {month_name or month_num} {year_val}.{hint}"
                         else:
-                            response = f"I don't see any records for {client_name or 'that bill'} in my records."
+                            response = f"I don't see any records for {client_name or 'that bill'} in my records.{hint}"
                         self._store_conversation(user_id, message, response)
                         return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
                     display_client = (rows[0].get("client_name") or client_name or "Client").strip()
@@ -1668,6 +1775,14 @@ class IntentService:
                 self._store_conversation(user_id, message, response)
                 return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
 
+            # 3b. Delete intent → soft-delete (SET "isDeleted" = true)
+            _DELETE_TRIGGERS = ["delete", "remove", "erase", "trash", "discard"]
+            is_delete = any(w in message.lower() for w in _DELETE_TRIGGERS) and any(
+                w in message.lower() for w in ["job", "entry", "record", "row", "last", "this", "it", "that"]
+            )
+            if is_delete:
+                return self._handle_soft_delete(user_id, message, data_user_id, conversation_history)
+
             # 4. SQL path: intent → generate SQL → validate → execute on Supabase → format → response
             columns = [c for c in JOB_ENTRIES_COLUMNS if not c.startswith("_")]
 
@@ -1686,6 +1801,30 @@ class IntentService:
                 conv = self.memory.get_conversation_history(user_id)
                 if conv and len(conv) >= 2:
                     last_assistant = conv[-1].get("content", "").lower() if conv[-1].get("role") == "assistant" else ""
+
+                    # "Would you like to see more/full details?" → re-run last query as SELECT *
+                    _detail_markers = ("more details", "see details", "full details", "see more", "more information", "see other jobs", "would you like")
+                    if any(m in last_assistant for m in _detail_markers) and "generate an invoice" not in last_assistant:
+                        ctx = self.memory.get_user_memory(user_id).get("uscf_context", {})
+                        last_sql = ctx.get("last_sql")
+                        if last_sql:
+                            import re as _re
+                            full_sql = _re.sub(r"^SELECT\s+.+?\s+FROM\s", "SELECT * FROM ", last_sql, count=1, flags=_re.IGNORECASE | _re.DOTALL)
+                            logger.info(f"[FOLLOWUP] User confirmed details; re-running as SELECT *: {full_sql[:200]}")
+                            exec_result = self.supabase.execute_sql(full_sql)
+                            if exec_result.get("ok"):
+                                rows = exec_result.get("rows", [])
+                                if rows:
+                                    self._update_sql_context(user_id, rows)
+                                    ctx["last_sql"] = full_sql
+                                    self.memory.update_user_memory(user_id, {"uscf_context": ctx})
+                                    payload = build_clean_payload(rows, "select")
+                                    response = self.gemini.synthesize_response(payload, message)
+                                    if not response or not response.strip():
+                                        response = "Here are the full details for your records."
+                                    self._store_conversation(user_id, message, response)
+                                    return {"operation": "query", "response": response, "trigger_invoice": False, "invoice_data": {}}
+
                     if "generate an invoice" in last_assistant and "would you like" in last_assistant:
                         # Generate invoice for the last job we found
                         ctx = self.memory.get_user_memory(user_id).get("uscf_context", {})
@@ -1768,6 +1907,7 @@ class IntentService:
 
             valid, sanitized_sql, err = validate_sql(sql)
             if not valid:
+                logger.warning(f"[QUERY_FAIL] SQL validation failed for user {user_id}: {err} | SQL: {sql[:200]}")
                 response = query_invalid_phrase()
                 self._store_conversation(user_id, message, response)
                 return {"operation": "query", "response": response, "trigger_invoice": False, "invoice_data": {}}
@@ -1810,6 +1950,7 @@ class IntentService:
 
             exec_result = self.supabase.execute_sql(sanitized_sql)
             if not exec_result.get("ok"):
+                logger.error(f"[QUERY_FAIL] SQL execution failed for user {user_id}: {exec_result.get('error')} | SQL: {sanitized_sql[:200]}")
                 response = format_response(
                     ERROR_MODE,
                     error_detail=exec_result.get("error") or error_calm_phrase(),
@@ -1819,6 +1960,7 @@ class IntentService:
 
             rows = exec_result.get("rows", [])
             op = exec_result.get("operation", "select")
+            logger.info(f"[QUERY] op={op}, rows={len(rows)}, user={user_id}, msg='{message[:60]}'")
 
             if op == "update":
                 rowcount = exec_result.get("rowcount", 0)
@@ -1846,6 +1988,7 @@ class IntentService:
                     if count_result.get("ok") and count_result.get("rows"):
                         has_data = int(count_result["rows"][0].get("cnt", 0)) > 0
                     if not has_data:
+                        logger.info(f"[QUERY_FAIL] User {user_id} has NO data at all (0 rows in job_entries)")
                         user_name = self._get_user_name(user_id)
                         greeting = f"{user_name}, you" if user_name else "You"
                         response = (
@@ -1856,17 +1999,25 @@ class IntentService:
                             "Once you have jobs, I can answer queries, send reminders, and generate invoices!"
                         )
                     else:
+                        logger.warning(f"[QUERY_FAIL] 0 rows but user HAS data. SQL returned nothing for: {sanitized_sql[:200]}")
                         response = format_response(ERROR_MODE)
                     self._store_conversation(user_id, message, response)
                     return {"operation": "query", "response": response, "trigger_invoice": False, "invoice_data": {}}
                 self._update_sql_context(user_id, rows)
+                # Store last SQL so "Yes, show details" follow-ups can re-run it as SELECT *
+                ctx = self.memory.get_user_memory(user_id).get("uscf_context", {})
+                ctx["last_sql"] = sanitized_sql
+                self.memory.update_user_memory(user_id, {"uscf_context": ctx})
                 payload = build_clean_payload(rows, "select")
                 response = self.gemini.synthesize_response(payload, message)
                 if not response or not response.strip():
+                    logger.warning(f"[QUERY_FAIL] synthesize_response returned empty for {len(rows)} rows, msg='{message[:60]}'")
                     response = "I found matching records but couldn't format the reply. Try asking again?"
+                else:
+                    logger.info(f"[QUERY] Success: {len(rows)} rows, response length={len(response)}")
 
         except Exception as e:
-            logger.error(f"Execution failure: {e}")
+            logger.error(f"[QUERY_FAIL] Exception for user {user_id}, msg='{message[:60]}': {e}", exc_info=True)
             user_name = self._get_user_name(user_id)
             if user_name:
                 response = format_response(ERROR_MODE, error_detail=f"Sorry {user_name}, {error_calm_phrase().lower()}")
@@ -1897,11 +2048,11 @@ class IntentService:
 
         # "how many jobs" / "count" / "total jobs"
         if re.search(r'\b(how\s+many|count|total\s+number\s+of|number\s+of)\b.*\b(job|entr|record|work)\b', msg):
-            return f"SELECT COUNT(*) AS total_jobs FROM public.job_entries WHERE user_id = '{uid}' AND {_not_deleted}"
+            return f"SELECT COUNT(*) AS total_jobs FROM public.job_entries WHERE user_id = '{uid}' AND (\"isDeleted\" IS NOT TRUE)"
 
         # "total fees" / "total earnings" / "sum of fees"
         if re.search(r'\b(total|sum|overall)\b.*\b(fees|earning|income|revenue|billing)\b', msg):
-            return f"SELECT SUM(fees) AS total_fees FROM public.job_entries WHERE user_id = '{uid}' AND {_not_deleted}"
+            return f"SELECT SUM(fees) AS total_fees FROM public.job_entries WHERE user_id = '{uid}' AND (\"isDeleted\" IS NOT TRUE)"
 
         # "show all jobs" / "list jobs" / "my jobs"
         if re.search(r'\b(show|list|all|my)\b.*\b(job|entr|record|work)\b', msg):
