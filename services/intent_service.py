@@ -20,6 +20,7 @@ from utils.pending_reminders import get_pending, clear_pending, remove_single
 from utils.logger import logger
 from typing import Dict, List, Optional
 import json
+import os
 import re
 
 class IntentService:
@@ -98,6 +99,115 @@ class IntentService:
         """Store user message and bot response in conversation history."""
         self.memory.add_message(user_id, "user", user_message)
         self.memory.add_message(user_id, "assistant", bot_response)
+
+    # ── Structured intent tracking for context reconstruction ──
+
+    def _save_last_intent(self, user_id: str, *, operation: str = None, client_name: str = None,
+                          month: str = None, year=None, entity: str = None,
+                          pending_clarification: str = None, extra: dict = None):
+        """Persist the most recent structured intent so follow-ups can inherit it."""
+        intent = {k: v for k, v in {
+            "operation": operation,
+            "client_name": client_name,
+            "month": month,
+            "year": year,
+            "entity": entity,
+            "pending_clarification": pending_clarification,
+        }.items() if v is not None}
+        if extra:
+            intent.update(extra)
+        self.memory.update_user_memory(user_id, {"last_intent": intent})
+        logger.info(f"[CONTEXT] Saved last_intent for {user_id}: {intent}")
+
+    def _reconstruct_message(self, user_id: str, message: str, conversation_history: List[Dict]) -> str:
+        """
+        Context reconstruction: if the message is short/ambiguous, merge it
+        with stored last_intent and recent conversation to produce a fully
+        self-contained query.  Returns the original message unchanged when no
+        reconstruction is needed.
+        """
+        msg_lower = message.strip().lower()
+        word_count = len(message.strip().split())
+
+        # Skip reconstruction for messages that are already self-contained
+        # (long enough AND contain an action verb + entity)
+        _ACTION_VERBS = {"generate", "create", "send", "show", "get", "list", "give",
+                         "update", "delete", "remove", "add", "fetch", "download",
+                         "make", "prepare", "invoice", "query", "find", "search"}
+        has_action = any(v in msg_lower for v in _ACTION_VERBS)
+        if word_count >= 4 and has_action:
+            return message  # Already self-contained
+
+        # Short or ambiguous message — try to reconstruct from context
+        user_mem = self.memory.get_user_memory(user_id)
+        last_intent = user_mem.get("last_intent", {})
+        if not last_intent:
+            return message  # No prior context to merge
+
+        pending = last_intent.get("pending_clarification", "")
+        operation = last_intent.get("operation", "")
+        client_name = last_intent.get("client_name", "")
+        month_val = last_intent.get("month", "")
+        entity = last_intent.get("entity", "")
+
+        # Get last assistant message to understand what was asked
+        last_assistant_msg = ""
+        if conversation_history:
+            assistant_msgs = [m for m in conversation_history if m.get("role") == "assistant"]
+            if assistant_msgs:
+                last_assistant_msg = assistant_msgs[-1].get("content", "").lower()
+
+        reconstructed = None
+
+        # Case 1: Bot asked "Which month?" and user replied with a month name
+        _MONTH_NAMES = {"january", "february", "march", "april", "may", "june",
+                        "july", "august", "september", "october", "november", "december",
+                        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec"}
+        first_word = msg_lower.split()[0] if msg_lower.split() else ""
+        is_month_reply = first_word in _MONTH_NAMES or any(m in msg_lower for m in _MONTH_NAMES)
+        if is_month_reply and pending == "month" and client_name:
+            verb = "Send" if "send" in operation.lower() else "Generate"
+            reconstructed = f"{verb} invoice for {client_name} for {message.strip()}"
+
+        # Case 2: Bot asked for a client name and user replied with one
+        elif pending == "client_name" and word_count <= 4:
+            if "invoice" in entity or "invoice" in operation.lower():
+                month_part = f" for {month_val}" if month_val else ""
+                reconstructed = f"Generate invoice for {message.strip()}{month_part}"
+            else:
+                reconstructed = f"Show jobs for {message.strip()}"
+
+        # Case 3: User says something like "for March" or "for Garnier"
+        elif msg_lower.startswith("for ") and word_count <= 4:
+            rest = message.strip()[4:]  # strip "for "
+            rest_lower = rest.lower().strip()
+            if any(m in rest_lower for m in _MONTH_NAMES) and client_name:
+                verb = "Send" if "send" in operation.lower() else "Generate"
+                reconstructed = f"{verb} invoice for {client_name} for {rest.strip()}"
+            elif operation and client_name:
+                reconstructed = f"{operation} for {client_name} for {rest.strip()}"
+
+        # Case 4: Very short replies (1-2 words) with a pending clarification
+        elif word_count <= 2 and pending and client_name:
+            if pending == "month":
+                verb = "Send" if "send" in operation.lower() else "Generate"
+                reconstructed = f"{verb} invoice for {client_name} for {message.strip()}"
+            elif pending == "confirm":
+                pass  # Let awaiting_* handlers deal with yes/no
+
+        # Case 5: "this month", "last month", "this year" relative time with prior client
+        elif client_name and any(t in msg_lower for t in ["this month", "last month", "this year", "last year"]):
+            if "invoice" in entity or "invoice" in operation.lower():
+                reconstructed = f"Generate invoice for {client_name} for {message.strip()}"
+            else:
+                reconstructed = f"Show jobs for {client_name} for {message.strip()}"
+
+        if reconstructed and reconstructed.strip().lower() != message.strip().lower():
+            logger.info(f"[CONTEXT] Reconstructed message: '{message}' → '{reconstructed}' "
+                        f"(last_intent={last_intent})")
+            return reconstructed
+
+        return message
 
     def _get_schema_and_columns(self, records: List[Dict]) -> tuple:
         """Return (schema_description, allowed_columns, date_column). Prefer AI-generated schema; fallback to rule-based."""
@@ -637,6 +747,16 @@ class IntentService:
             brand = extracted.get("brand_name", "")
             client = extracted.get("client_name", "")
             response = f"Job saved! ✅ {brand} has been added to your records."
+
+            # Check if user had a compound intent (e.g. "add job and send invoice")
+            user_mem = self.memory.get_user_memory(user_id)
+            suggested_next = user_mem.get("suggested_next_action")
+            if suggested_next:
+                # Keep suggested_next_action in memory so the handler can use it
+                self.memory.update_user_memory(user_id, {"awaiting_compound_response": True})
+                response += f"\n\nYou also mentioned: \"{suggested_next}\"\nWant me to do that now? (Yes / No)"
+                logger.info(f"[COMPOUND] Suggesting next action after job save: '{suggested_next}'")
+
             # Store last job context so user can reference "this job" in follow-up
             self.memory.update_user_memory(user_id, {
                 "last_saved_job": {
@@ -745,17 +865,20 @@ class IntentService:
             extracted = None
 
         if not extracted:
+            # No fields extracted — user likely just expressed intent ("add a job")
+            # without providing actual data. Show a friendly prompt, not an error.
+            self.memory.update_user_memory(user_id, {"awaiting_job_input": True})
             response = (
-                "I couldn't understand the job details. Please try again.\n\n"
+                "Describe the job in one message.\n\n"
                 "Example:\n"
                 "Bridgestone\n"
                 "10 Feb\n"
-                "Master film 30 sec\n"
+                "Master film 30 sec + 4 cutdowns\n"
+                "Client: The Good Take\n"
                 "Fees: 25k"
             )
-            self.memory.update_user_memory(user_id, {"awaiting_job_input": True})
             self._store_conversation(user_id, content, response)
-            return {"operation": "smart_capture_failed", "response": response, "trigger_invoice": False, "invoice_data": {}}
+            return {"operation": "smart_capture_prompt", "response": response, "trigger_invoice": False, "invoice_data": {}}
 
         # Check required fields
         required = ["brand_name", "job_date", "job_description_details"]
@@ -798,6 +921,7 @@ class IntentService:
 
     def _handle_invoice_month_reply(self, user_id: str, message: str, user_mem: dict, data_user_id: str, conversation_history: list) -> Dict:
         """Handle user providing a month after bot asked 'Which month?' for invoice."""
+        import re as _re
         from datetime import datetime
         # Clear the awaiting state
         client_name = user_mem.get("pending_invoice_client", "")
@@ -825,7 +949,7 @@ class IntentService:
                 break
 
         if not month_num:
-            response = f"I couldn't detect a month from your reply. Please say something like: 'March' or 'For April'."
+            response = f"I couldn't detect a month from your reply. Please say something like: 'March' or 'March 2025'."
             self._store_conversation(user_id, message, response)
             # Re-set awaiting state
             self.memory.update_user_memory(user_id, {
@@ -835,14 +959,80 @@ class IntentService:
             })
             return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
 
-        year_val = datetime.now().year
-        # Reconstruct full invoice message and route through invoice logic
-        synthetic_msg = f"Generate invoice for {client_name} for {month_name}"
+        # Extract year from user reply (e.g. "April 2025", "March 2024")
+        # Look for 4-digit year in the message
+        year_match = _re.search(r'\b(20\d{2})\b', message)
+        if year_match:
+            year_val = int(year_match.group(1))
+        else:
+            year_val = datetime.now().year
+
+        # Build synthetic message preserving ALL extracted entities
+        year_part = f" {year_val}" if year_match else ""
+        synthetic_msg = f"Generate invoice for {client_name} for {month_name}{year_part}"
         if send_email:
-            synthetic_msg = f"Send invoice for {client_name} for {month_name} over email"
-        logger.info(f"[INVOICE_FOLLOWUP] Resuming invoice flow: client={client_name}, month={month_name}, synthetic='{synthetic_msg}'")
+            synthetic_msg = f"Send invoice for {client_name} for {month_name}{year_part} over email"
+        logger.info(f"[INVOICE_FOLLOWUP] Resuming invoice flow: client={client_name}, month={month_name}, year={year_val}, synthetic='{synthetic_msg}'")
         # Re-enter process_request with the full synthetic message
         return self.process_request(user_id=user_id, message=synthetic_msg)
+
+    def _handle_send_confirmation(self, user_id: str, message: str) -> Dict:
+        """Handle user confirming/declining sending invoice to client email."""
+        # Clear the awaiting flag
+        pending = self.memory.get_user_memory(user_id).get("pending_send_invoice", {})
+        self.memory.update_user_memory(user_id, {
+            "awaiting_send_confirmation": False,
+            "pending_send_invoice": None,
+        })
+
+        msg_lower = message.strip().lower()
+        _YES = {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "go ahead", "send it", "do it", "confirm", "yes please"}
+        if msg_lower in _YES:
+            poc_email = pending.get("poc_email", "")
+            client_name = pending.get("client_name", "Client")
+            month_display = pending.get("month", "Request")
+            year_val = pending.get("year")
+            row_ids = pending.get("row_ids", [])
+
+            if not poc_email:
+                response = "I don't have the client email anymore. Please try again with 'Send invoice for ...'."
+                self._store_conversation(user_id, message, response)
+                return {"operation": "send_cancelled", "response": response, "trigger_invoice": False, "invoice_data": {}}
+
+            # Find the generated PDF
+            safe_client = client_name.replace(" ", "_")
+            safe_month = month_display.replace(" ", "_")
+            pdf_path = os.path.join("output", f"Invoice_{safe_client}_{safe_month}.pdf")
+
+            if not os.path.exists(pdf_path):
+                response = "I can't find the generated PDF. Please regenerate the invoice first."
+                self._store_conversation(user_id, message, response)
+                return {"operation": "send_cancelled", "response": response, "trigger_invoice": False, "invoice_data": {}}
+
+            ok = self.email.send_invoice_email(
+                to_email=poc_email,
+                client_name=client_name,
+                month=month_display,
+                year=year_val,
+                pdf_path=pdf_path,
+            )
+            if ok:
+                # Update invoice_date for affected rows
+                if row_ids:
+                    ids_str = ",".join(f"'{rid}'" for rid in row_ids)
+                    self.supabase.execute_sql(
+                        f"UPDATE public.job_entries SET invoice_date = CURRENT_DATE WHERE id IN ({ids_str})"
+                    )
+                    logger.info(f"[INVOICE] Updated invoice_date for {len(row_ids)} row(s)")
+                response = f"Invoice has been sent to {poc_email}. ✅"
+            else:
+                response = "I couldn't send the invoice email. Please check the email configuration and try again."
+            self._store_conversation(user_id, message, response)
+            return {"operation": "send_confirmed", "response": response, "trigger_invoice": False, "invoice_data": {}}
+        else:
+            response = "👍 Got it, invoice not sent. You can say 'Send invoice for ...' anytime to email it."
+            self._store_conversation(user_id, message, response)
+            return {"operation": "send_declined", "response": response, "trigger_invoice": False, "invoice_data": {}}
 
     def _handle_poc_email_response(self, user_id: str, message: str) -> Dict:
         """Handle user providing a client POC email after invoice generation."""
@@ -1354,17 +1544,48 @@ class IntentService:
             if user_mem.get("pending_disambiguation"):
                 return self._handle_disambiguation_reply(user_id, message, user_mem["pending_disambiguation"])
 
-            if user_mem.get("awaiting_job_input"):
-                return self._extract_and_confirm(user_id, message)
+            # Handle compound intent follow-up ("Yes" after "You also mentioned: ...")
+            if user_mem.get("awaiting_compound_response"):
+                pending_action = user_mem.get("suggested_next_action", "")
+                # Always clear the state first (interruption-safe)
+                self.memory.update_user_memory(user_id, {
+                    "awaiting_compound_response": False,
+                    "suggested_next_action": None,
+                })
+                msg_lower_check = message.strip().lower()
+                _YES = {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "go ahead", "do it", "yes please"}
+                if msg_lower_check in _YES and pending_action:
+                    logger.info(f"[COMPOUND] User confirmed next action: '{pending_action}'")
+                    return self.process_request(user_id=user_id, message=pending_action)
+                elif msg_lower_check in {"no", "nah", "nope", "skip", "not now", "later"}:
+                    response = "👍 No problem. Let me know if you need anything else."
+                    self._store_conversation(user_id, message, response)
+                    return {"operation": "compound_declined", "response": response, "trigger_invoice": False, "invoice_data": {}}
+                # else: user said something unrelated — fall through to normal processing
 
             # 0b. Check for "add job" / "+" trigger → AI Smart Capture
             msg_stripped = message.strip()
-            add_job_triggers = ["add job", "add a job", "add new job", "new job",
-                               "log a job", "log job", "record job", "record a job"]
+            add_job_triggers = ["add job", "add a job", "add new job", "add a new job",
+                               "new job", "log a job", "log job", "record job", "record a job",
+                               "create job", "create a job", "create a new job"]
             is_add_job = any(t in msg_stripped.lower() for t in add_job_triggers)
             is_plus = msg_stripped.startswith("+") and len(msg_stripped) > 1
             if is_add_job or is_plus:
-                return self._start_smart_capture(user_id, message)
+                # Check for compound intent using AI (e.g. "add a job and send invoice")
+                first_part_msg = message
+                if len(message.split()) >= 6:  # only check if message is long enough
+                    intents = self.gemini.decompose_compound_intent(message)
+                    if intents and len(intents) > 1:
+                        first_part_msg = intents[0]
+                        suggested_next = intents[1]
+                        logger.info(f"[COMPOUND] AI split: first='{first_part_msg}', next='{suggested_next}'")
+                        self.memory.update_user_memory(user_id, {
+                            "suggested_next_action": suggested_next,
+                        })
+                return self._start_smart_capture(user_id, first_part_msg)
+
+            if user_mem.get("awaiting_job_input"):
+                return self._extract_and_confirm(user_id, message)
 
             # 0b1.4. Check if user is providing the month for a pending invoice
             if user_mem.get("awaiting_invoice_month"):
@@ -1373,6 +1594,10 @@ class IntentService:
             # 0b1.5. Check if user is providing a client POC email
             if user_mem.get("awaiting_poc_email"):
                 return self._handle_poc_email_response(user_id, message)
+
+            # 0b1.6. Check if user is confirming sending invoice to client email
+            if user_mem.get("awaiting_send_confirmation"):
+                return self._handle_send_confirmation(user_id, message)
 
             # 0b2. Check if user is responding with bank details (awaiting state)
             if user_mem.get("awaiting_bank_details"):
@@ -1445,6 +1670,14 @@ class IntentService:
                             response = "👍 Got it. Let me know if you need anything else."
                             self._store_conversation(user_id, message, response)
                             return {"operation": "decline_followup", "response": response, "trigger_invoice": False, "invoice_data": {}}
+
+            # ── Context Reconstruction ──────────────────────────────────
+            # For short / ambiguous messages, merge with stored last_intent
+            # to produce a fully self-contained query before main pipeline.
+            original_message = message
+            message = self._reconstruct_message(user_id, message, conversation_history)
+            if message != original_message:
+                msg_lower = message.strip().lower()  # refresh after reconstruction
 
             # 0c. Payment reminder queries
             reminder_keywords = [
@@ -1527,14 +1760,91 @@ class IntentService:
                     "trigger_invoice": False,
                 }
 
-            # 2. Invoice retrieval (keyword-based; use LLM to extract params, fetch from Supabase)
+            # 1b. "Send to client" follow-up — use AI to detect intent, no pattern list
             msg_lower = message.lower()
+            cached_invoice = user_mem.get("last_generated_invoice")
+
+            # TTL: expire cached invoice after 30 minutes
+            if cached_invoice:
+                from datetime import datetime, timedelta
+                cached_at = cached_invoice.get("cached_at", "")
+                if cached_at:
+                    try:
+                        cache_time = datetime.fromisoformat(cached_at)
+                        if datetime.now() - cache_time > timedelta(minutes=30):
+                            logger.info(f"[SEND_CHECK] Cached invoice expired (>30min), clearing")
+                            self.memory.update_user_memory(user_id, {"last_generated_invoice": None})
+                            cached_invoice = None
+                    except (ValueError, TypeError):
+                        pass
+
+            if cached_invoice:
+                cached_client = cached_invoice.get("client_name", "")
+                # Get last bot message for context
+                last_bot_msg = ""
+                if conversation_history:
+                    bot_msgs = [m for m in conversation_history if m.get("role") == "assistant"]
+                    if bot_msgs:
+                        last_bot_msg = bot_msgs[-1].get("content", "")
+                is_send_to_client = self.gemini.is_send_to_client_intent(message, last_bot_msg, cached_client=cached_client)
+                logger.info(f"[SEND_CHECK] AI determined send_to_client={is_send_to_client} for msg='{message[:60]}' (cached_client={cached_client})")
+            else:
+                is_send_to_client = False
+
+            if is_send_to_client and cached_invoice:
+                cached_client = cached_invoice.get("client_name", "Client")
+                cached_month = cached_invoice.get("month", "Request")
+                cached_year = cached_invoice.get("year")
+                poc_email = cached_invoice.get("poc_email", "")
+                cached_row_ids = cached_invoice.get("row_ids", [])
+
+                if not poc_email:
+                    response = (
+                        f"I have the invoice for {cached_client} ({cached_month}) ready, "
+                        f"but there's no contact email (poc_email) on file.\n\n"
+                        f"Please provide the client's email so I can send it:\n"
+                        f"Example: client@agency.com"
+                    )
+                    self.memory.update_user_memory(user_id, {
+                        "awaiting_poc_email": True,
+                        "pending_send_invoice": {
+                            "client_name": cached_client,
+                            "month": cached_month,
+                            "year": cached_year,
+                            "row_ids": cached_row_ids,
+                        },
+                    })
+                    self._store_conversation(user_id, message, response)
+                    return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
+
+                # We have the PDF and the email — ask for confirmation
+                self.memory.update_user_memory(user_id, {
+                    "awaiting_send_confirmation": True,
+                    "pending_send_invoice": {
+                        "client_name": cached_client,
+                        "month": cached_month,
+                        "year": cached_year,
+                        "poc_email": poc_email,
+                        "row_ids": cached_row_ids,
+                    },
+                })
+                response = (
+                    f"I have the invoice for {cached_client} ({cached_month}) ready.\n\n"
+                    f"Should I email it to **{poc_email}**?\n"
+                    f"Reply 'Yes' to send or 'No' to skip."
+                )
+                logger.info(f"[INVOICE] Using cached invoice for send-to-client: {cached_client} {cached_month}")
+                self._store_conversation(user_id, message, response)
+                return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
+
+            # 2. Invoice retrieval (keyword-based; use LLM to extract params, fetch from Supabase)
             _INVOICE_VERBS = ["get", "download", "send", "give", "show", "retrieve", "fetch",
                               "generate", "create", "make", "prepare", "need", "want", "share"]
             has_verb = any(w in msg_lower for w in _INVOICE_VERBS)
             has_invoice_word = "invoice" in msg_lower or "bill" in msg_lower
-            # Also match standalone "invoice for <client>" (no verb needed)
-            is_retrieval = (has_verb and has_invoice_word) or (has_invoice_word and "for " in msg_lower)
+            # If the message mentions "invoice" or "bill", always route to the
+            # invoice flow — the LLM intent parser handles typos and variations.
+            is_retrieval = has_invoice_word
             logger.info(f"[INVOICE_CHECK] msg='{message[:80]}' has_verb={has_verb} has_invoice={has_invoice_word} is_retrieval={is_retrieval}")
             if is_retrieval:
                 schema_info = logic.get_schema_for_intent() if hasattr(logic, "get_schema_for_intent") else None
@@ -1551,8 +1861,12 @@ class IntentService:
                         "mail invoice",
                         "share invoice via email",
                         "forward invoice",
+                        "send invoice to client",
+                        "send it to client",
+                        "send to client",
+                        "send invoice to the client",
                     ]
-                    if "email" in msg_lower or "e-mail" in msg_lower or any(k in msg_lower for k in email_keywords):
+                    if "email" in msg_lower or "e-mail" in msg_lower or "to client" in msg_lower or any(k in msg_lower for k in email_keywords):
                         intent_result["operation"] = "SEND_EMAIL"
 
                     client_name = (params.get("client_name") or "").strip()
@@ -1560,6 +1874,14 @@ class IntentService:
                     year_val = params.get("year")
                     bill_number = (params.get("bill_number") or "").strip() or None
                     month_num = month_name_to_number(month_name) if month_name else None
+
+                    # Validate: if user's message contains an explicit year but LLM
+                    # missed it, extract it directly from the message text.
+                    if not year_val:
+                        _year_match = re.search(r'\b(20\d{2})\b', message)
+                        if _year_match:
+                            year_val = int(_year_match.group(1))
+                            logger.info(f"[INVOICE] LLM missed year; extracted {year_val} from message text")
                     if not year_val:
                         from datetime import datetime
                         year_val = datetime.now().year
@@ -1611,9 +1933,49 @@ class IntentService:
                             logger.info(f"[INVOICE] Resolved from last_saved_job: client={client_name}, month={month_name}")
 
                     if not client_name and not bill_number:
+                        # Save intent so follow-up can provide client name
+                        op_name = intent_result.get("operation", "invoice")
+                        self._save_last_intent(user_id, operation=op_name, entity="invoice",
+                                               month=month_name, year=year_val,
+                                               pending_clarification="client_name")
                         response = "I need a client name or bill number to find an invoice. For example: 'Send invoice for Garnier for March'."
                         self._store_conversation(user_id, message, response)
                         return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
+
+                    # Validate client exists in DB before proceeding
+                    if client_name and not bill_number:
+                        safe_uid = data_user_id.replace("'", "''")
+                        safe_cn = client_name.replace("'", "''")
+                        check_sql = (
+                            f"SELECT DISTINCT client_name FROM public.job_entries "
+                            f"WHERE user_id = '{safe_uid}' AND client_name ILIKE '%{safe_cn}%' "
+                            f"AND (\"isDeleted\" IS NOT TRUE)"
+                        )
+                        check_result = self.supabase.execute_sql(check_sql)
+                        matching_clients = [r["client_name"] for r in (check_result.get("rows") or []) if r.get("client_name")]
+                        if not matching_clients:
+                            # No matching client — show available clients and stop
+                            all_clients_sql = (
+                                f"SELECT DISTINCT client_name FROM public.job_entries "
+                                f"WHERE user_id = '{safe_uid}' AND client_name IS NOT NULL "
+                                f"AND (\"isDeleted\" IS NOT TRUE) ORDER BY client_name"
+                            )
+                            all_result = self.supabase.execute_sql(all_clients_sql)
+                            available = [r["client_name"] for r in (all_result.get("rows") or []) if r.get("client_name")]
+                            if available:
+                                client_list = "\n".join(f"• {c}" for c in available)
+                                response = (
+                                    f"I couldn't find a client named \"{client_name}\". "
+                                    f"Please check for typos.\n\n"
+                                    f"Your clients on record:\n{client_list}\n\n"
+                                    f"Try again with the correct name."
+                                )
+                            else:
+                                response = f"I couldn't find a client named \"{client_name}\" and you don't have any job entries yet."
+                            logger.info(f"[INVOICE] Client '{client_name}' not found for user {user_id}")
+                            self._store_conversation(user_id, message, response)
+                            return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
+
                     if client_name and not month_num and not bill_number:
                         # Check if user explicitly asked to send via email
                         send_email = "email" in msg_lower or "e-mail" in msg_lower
@@ -1623,6 +1985,13 @@ class IntentService:
                             response = f"I see you want an invoice for {client_name}. Which month?\n\n{month_options}\n\nReply with the month, e.g. 'Send invoice for {client_name} for March 2025'."
                         else:
                             response = f"I see you want an invoice for {client_name}. Which month? For example: 'Send invoice for {client_name} for March'."
+                        # Save intent so follow-up "March" reconstructs to full query
+                        # Do NOT store inferred year — only store confirmed fields.
+                        # Year will come from the user's follow-up reply (e.g. "April 2025").
+                        op_name = "SEND_EMAIL" if send_email else intent_result.get("operation", "invoice")
+                        self._save_last_intent(user_id, operation=op_name, client_name=client_name,
+                                               entity="invoice",
+                                               pending_clarification="month")
                         # Set awaiting state so the next reply routes to invoice month handler
                         self.memory.update_user_memory(user_id, {
                             "awaiting_invoice_month": True,
@@ -1686,48 +2055,28 @@ class IntentService:
                             self._store_conversation(user_id, message, response)
                             return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
 
-                        # Reuse existing PDF if present; otherwise generate it
-                        from services.invoice_service import InvoiceService
-                        from services.invoice_generation_service import InvoiceGenerationService
-
-                        safe_client = display_client.replace(" ", "_")
-                        safe_month = month_display.replace(" ", "_")
-                        pdf_candidate = os.path.join("output", f"Invoice_{safe_client}_{safe_month}.pdf")
-
-                        pdf_path = pdf_candidate if os.path.exists(pdf_candidate) else None
-                        if not pdf_path:
-                            summary = InvoiceService.process_invoice_data(rows, display_client, month_display)
-                            bank_result = self.supabase.get_user_bank_details(data_user_id)
-                            bank_details = bank_result.get("data") if bank_result.get("ok") else None
-                            pdf_path = InvoiceGenerationService().generate_pdf(summary, rows, bank_details=bank_details)
-
-                        if not pdf_path:
-                            response = "I tried to generate the invoice PDF but something went wrong. Please try again."
-                            self._store_conversation(user_id, message, response)
-                            return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
-
-                        # Send via Resend with attachment
-                        ok = self.email.send_invoice_email(
-                            to_email=poc_email,
-                            client_name=display_client,
-                            month=month_display,
-                            year=year_val,
-                            pdf_path=pdf_path,
+                        # Generate the invoice first, then ask for confirmation before emailing
+                        invoice_data["send_to_client"] = True
+                        # Store pending send confirmation so user can approve
+                        self.memory.update_user_memory(user_id, {
+                            "awaiting_send_confirmation": True,
+                            "pending_send_invoice": {
+                                "client_name": display_client,
+                                "month": month_display,
+                                "year": year_val,
+                                "poc_email": poc_email,
+                                "row_ids": [r["id"] for r in rows if r.get("id")],
+                            },
+                        })
+                        # Generate PDF and send to user first via WhatsApp/Telegram
+                        trigger_invoice = True
+                        response = (
+                            f"I've generated the invoice for {display_client} ({month_display}).\n\n"
+                            f"Should I email it to **{poc_email}**?\n"
+                            f"Reply 'Yes' to send or 'No' to skip."
                         )
-                        if ok:
-                            response = f"The invoice has been sent to {poc_email}."
-                            # Update invoice_date for all affected rows
-                            row_ids = [r["id"] for r in rows if r.get("id")]
-                            if row_ids:
-                                ids_str = ",".join(f"'{rid}'" for rid in row_ids)
-                                self.supabase.execute_sql(
-                                    f"UPDATE public.job_entries SET invoice_date = CURRENT_DATE WHERE id IN ({ids_str})"
-                                )
-                                logger.info(f"[INVOICE] Updated invoice_date for {len(row_ids)} row(s)")
-                        else:
-                            response = "I couldn't send the invoice email. Please check the email configuration and try again."
                         self._store_conversation(user_id, message, response)
-                        return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": False, "invoice_data": {}}
+                        return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": trigger_invoice, "invoice_data": invoice_data}
 
                     # Check if bank details exist before generating invoice
                     bank_result = self.supabase.get_user_bank_details(data_user_id)
@@ -1753,6 +2102,9 @@ class IntentService:
 
                     # Default path: generate PDF and send via WhatsApp/Telegram (existing behavior)
                     trigger_invoice = True
+                    self._save_last_intent(user_id, operation="generate_invoice",
+                                           client_name=display_client, month=month_display,
+                                           year=year_val, entity="invoice")
                     response = f"Confirmed. I've found the record for {display_client}. Generating the invoice now."
                     self._store_conversation(user_id, message, response)
                     return {"operation": "ACTION_TRIGGER", "response": response, "trigger_invoice": trigger_invoice, "invoice_data": invoice_data}
@@ -1882,6 +2234,14 @@ class IntentService:
 
             # Handle clarification from planner
             if plan_result.get("clarification"):
+                # Save intent context so follow-up can fill in the gap
+                plan_data = plan_result.get("plan", {}) if isinstance(plan_result.get("plan"), dict) else {}
+                self._save_last_intent(
+                    user_id, operation=plan_data.get("operation", "query"),
+                    client_name=plan_data.get("filters", {}).get("client_name", "") if isinstance(plan_data.get("filters"), dict) else "",
+                    entity="query",
+                    pending_clarification="details",
+                )
                 response = plan_result["clarification"]
                 self._store_conversation(user_id, message, response)
                 return {"operation": "query", "response": response, "trigger_invoice": False, "invoice_data": {}}
@@ -1913,7 +2273,7 @@ class IntentService:
                 return {"operation": "query", "response": response, "trigger_invoice": False, "invoice_data": {}}
 
             # Disambiguation: if an UPDATE matches multiple rows, show real options before executing.
-            # This covers soft-deletes (SET is_deleted = TRUE) and any other UPDATE.
+            # This covers soft-deletes (SET "isDeleted" = TRUE) and any other UPDATE.
             if sanitized_sql.upper().lstrip().startswith("UPDATE"):
                 _where_m = re.search(r'WHERE\s+(.+?)(?=\s+RETURNING\b|$)', sanitized_sql, re.IGNORECASE | re.DOTALL)
                 if _where_m:
@@ -1978,11 +2338,18 @@ class IntentService:
                     response = format_response(ASSISTANT_MODE, insert_confirmation=True)
                 else:
                     response = format_response(ASSISTANT_MODE, insert_confirmation=True)
+                # Check for compound intent — suggest next action after job save
+                insert_mem = self.memory.get_user_memory(user_id)
+                suggested_next = insert_mem.get("suggested_next_action")
+                if suggested_next:
+                    self.memory.update_user_memory(user_id, {"awaiting_compound_response": True})
+                    response += f"\n\nYou also mentioned: \"{suggested_next}\"\nWant me to do that now? (Yes / No)"
+                    logger.info(f"[COMPOUND] Suggesting next action after insert: '{suggested_next}'")
             else:
                 if not rows:
                     # Check if user has ANY data at all
                     count_result = self.supabase.execute_sql(
-                        f"SELECT COUNT(*) AS cnt FROM public.job_entries WHERE user_id = '{data_user_id.replace(chr(39), chr(39)+chr(39))}' AND (is_deleted IS NULL OR is_deleted = FALSE)"
+                        f"SELECT COUNT(*) AS cnt FROM public.job_entries WHERE user_id = '{data_user_id.replace(chr(39), chr(39)+chr(39))}' AND (\"isDeleted\" IS NOT TRUE)"
                     )
                     has_data = False
                     if count_result.get("ok") and count_result.get("rows"):
@@ -2039,7 +2406,7 @@ class IntentService:
         """
         msg = message.strip().lower()
         uid = user_id.replace("'", "''")
-        _not_deleted = "(is_deleted IS NULL OR is_deleted = FALSE)"
+        _not_deleted = "(\"isDeleted\" IS NOT TRUE)"
         base = f"SELECT * FROM public.job_entries WHERE user_id = '{uid}' AND {_not_deleted}"
 
         # "last job" / "latest job" / "most recent job" / "recent job"

@@ -158,9 +158,9 @@ class GeminiService:
             "- Use ONLY the provided structured data. Do not invent or assume values. Do not expose technical fields.\n"
             "- If a field is null, omit it naturally.\n"
             "- Convert dates to readable format (e.g. 20 Feb 2026). Mention fees naturally (e.g. ₹2,000).\n"
-            "- For multiple records: summarize intelligently, do not dump rows.\n"
+            "- For multiple records: use bullet points. Each bullet = one job/record. Format: '• [Date] – [Client/Brand]: [brief description], ₹[fee] ([paid/unpaid])'. Add a 1-line summary at the end (e.g. total jobs, total value).\n"
             "- For field_answer type: answer the user's question naturally (e.g. 'Your most recent client was Xiaomi.', 'That project was valued at ₹4,000.'). Never output raw field:value or one-word answers.\n"
-            "- Output plain text only, no bullet lists or key:value format. 2–4 sentences max.\n\n"
+            "- For single records or aggregates: plain text, 2–4 sentences max. No bullets needed.\n\n"
             "TONE RULES:\n"
             "- Default: composed and minimal, but you can use light transitions like 'Here’s the snapshot', 'Quick read:', or 'In short,'.\n"
             "- When context justifies it, add subtle momentum (never hype or over-celebrate):\n"
@@ -198,7 +198,7 @@ class GeminiService:
         try:
             out = self._call_api(
                 full_prompt,
-                generation_config={"temperature": 0.2, "maxOutputTokens": 300},
+                generation_config={"temperature": 0.2, "maxOutputTokens": 600},
             )
             if out and isinstance(out, str) and out.strip():
                 return out.strip()
@@ -494,6 +494,77 @@ class GeminiService:
                 "error_message": None,
                 "clarification_question": None,
             }
+
+    def decompose_compound_intent(self, message: str) -> Optional[List[str]]:
+        """
+        Check if a message contains multiple distinct intents.
+        Returns a list of individual intent strings if compound, or None if single intent.
+        Only called when the message is long enough to plausibly contain multiple intents.
+        """
+        self._ensure_initialized()
+        prompt = f"""Analyze this user message and determine if it contains multiple distinct action requests.
+
+Message: "{message}"
+
+Rules:
+- Only split if there are genuinely SEPARATE actions (e.g. "add a job AND send invoice")
+- Do NOT split a single action with details (e.g. "add a job for Garnier on 10 Feb" is ONE intent)
+- Do NOT split if the second part is just context for the first
+- Return the intents in the logical execution order
+
+Return JSON:
+- If SINGLE intent: {{"compound": false, "intents": ["{message}"]}}
+- If MULTIPLE intents: {{"compound": true, "intents": ["first action", "second action"]}}
+
+Return ONLY valid JSON, nothing else."""
+
+        try:
+            raw = self._call_api(prompt, generation_config={
+                "temperature": 0.0,
+                "maxOutputTokens": 200,
+                "responseMimeType": "application/json",
+            })
+            if not raw:
+                return None
+            result = json.loads(raw)
+            if result.get("compound") and len(result.get("intents", [])) > 1:
+                logger.info(f"[AI_COMPOUND] Decomposed into {len(result['intents'])} intents: {result['intents']}")
+                return result["intents"]
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"[AI_COMPOUND] Failed to decompose: {e}")
+        return None
+
+    def is_send_to_client_intent(self, message: str, last_bot_message: str = "", cached_client: str = "") -> bool:
+        """
+        Use AI to determine if the user is asking to send/email a previously
+        generated invoice to a client. Works with any phrasing — no pattern list.
+        """
+        self._ensure_initialized()
+        client_ctx = f'\nThe cached invoice is for client: "{cached_client}".' if cached_client else ""
+        prompt = f"""The bot just generated an invoice and sent it to the user.
+
+Last bot message: "{last_bot_message[:300]}"{client_ctx}
+User's reply: "{message}"
+
+Is the user asking to SEND or EMAIL this specific invoice to the client/recipient?
+Examples of YES: "send it to the client", "email this to them", "forward to poc", "send to client", "mail it", "share with client"
+Examples of NO: "thanks", "show me jobs", "generate another invoice", "what's the total"
+Also NO if the user mentions a DIFFERENT client name than the cached one.
+
+Return ONLY JSON: {{"send_to_client": true}} or {{"send_to_client": false}}"""
+
+        try:
+            raw = self._call_api(prompt, generation_config={
+                "temperature": 0.0,
+                "maxOutputTokens": 50,
+                "responseMimeType": "application/json",
+            })
+            if raw:
+                result = json.loads(raw)
+                return result.get("send_to_client", False)
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"[AI_SEND_CHECK] Failed: {e}")
+        return False
 
     def extract_job_fields(self, message: str, today: str = None) -> Optional[Dict]:
         """
