@@ -202,6 +202,7 @@ class SupabaseService:
         if not upper.startswith("SELECT") and not upper.startswith("INSERT") and not upper.startswith("UPDATE"):
             return {"ok": False, "error": "Only SELECT, INSERT, and UPDATE are allowed."}
 
+        conn = None
         try:
             conn = psycopg2.connect(self.db_url)
             conn.autocommit = True
@@ -216,7 +217,6 @@ class SupabaseService:
                             if hasattr(v, "isoformat") and v is not None:
                                 d[k] = v.isoformat()
                         out.append(d)
-                    conn.close()
                     return {"ok": True, "rows": out, "operation": "select"}
                 else:
                     rowcount = cur.rowcount
@@ -231,7 +231,6 @@ class SupabaseService:
                                     d[k] = v.isoformat()
                             out.append(d)
                         rows = out
-                    conn.close()
                     op = "update" if upper.startswith("UPDATE") else "insert"
                     return {"ok": True, "rows": rows, "rowcount": rowcount, "operation": op}
         except Exception as e:
@@ -246,6 +245,12 @@ class SupabaseService:
                     )
                 return {"ok": False, "error": "I couldn't reach the database right now. Please try again in a moment."}
             return {"ok": False, "error": "Something went wrong with that query. Please try again."}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def execute_read_only_sql(self, sql: str) -> Dict[str, Any]:
         """Alias for execute_sql (kept for backward compatibility)."""
@@ -350,8 +355,6 @@ class SupabaseService:
         if year:
             where.append("EXTRACT(YEAR FROM job_date) = %s")
             params.append(int(year))
-
-        where.append("(is_deleted IS NULL OR is_deleted = FALSE)")
 
         sql = (
             "SELECT * FROM public.job_entries "

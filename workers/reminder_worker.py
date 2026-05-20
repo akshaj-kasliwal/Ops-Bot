@@ -50,7 +50,8 @@ SELECT
     third_reminder_sent
 FROM public.job_entries
 WHERE
-    (paid IS NULL OR TRIM(paid) = '' OR LOWER(paid) IN ('false', 'no', 'unpaid'))
+    ("isDeleted" IS NOT TRUE)
+    AND (paid IS NULL OR TRIM(paid) = '' OR LOWER(paid) IN ('false', 'no', 'unpaid'))
     AND invoice_date IS NOT NULL
     AND (
         -- First reminder: 15+ days, not yet sent

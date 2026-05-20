@@ -1645,15 +1645,11 @@ class IntentService:
                         # Check what months actually have data for this client
                         hint = ""
                         if client_name:
-                            safe_client = client_name.replace("'", "''")
-                            safe_uid = data_user_id.replace("'", "''")
-                            avail_sql = (
-                                f"SELECT DISTINCT TO_CHAR(job_date, 'Month YYYY') AS period "
-                                f"FROM public.job_entries "
-                                f"WHERE user_id = '{safe_uid}' AND client_name ILIKE '%{safe_client}%' "
-                                f"AND job_date IS NOT NULL AND (\"isDeleted\" IS NOT TRUE) ORDER BY period"
-                            )
-                            avail = self.supabase.execute_sql(avail_sql)
+                            months_result = self.supabase.get_available_months_for_client(client_name, user_id=data_user_id)
+                            avail = {"ok": months_result.get("ok"), "rows": []}
+                            if months_result.get("ok") and months_result.get("months"):
+                                import calendar as _cal
+                                avail["rows"] = [{"period": m["label"]} for m in months_result["months"]]
                             periods = [r["period"].strip() for r in (avail.get("rows") or [])]
                             if periods:
                                 hint = f"\n\nI do have records for {client_name} in: {', '.join(periods)}."

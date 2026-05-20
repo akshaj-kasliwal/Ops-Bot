@@ -3,8 +3,15 @@ from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 import os
+import re
 import asyncio
 import httpx
+
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
+def _is_valid_uuid(val: str) -> bool:
+    return bool(_UUID_RE.match(val))
+
 from services.intent_service import IntentService
 from services.invoice_service import InvoiceService
 from services.whatsapp_service import WhatsAppService
@@ -408,6 +415,9 @@ async def _handle_send_all_reminders(callback_query: dict):
     )
 
     for job_id, level in job_pairs:
+        if not _is_valid_uuid(job_id):
+            failed.append(job_id)
+            continue
         fetch_sql = f"SELECT * FROM public.job_entries WHERE id = '{job_id}'"
         result = supabase_service.execute_sql(fetch_sql)
         if not result.get("ok") or not result.get("rows"):
@@ -485,6 +495,10 @@ async def _handle_reminder_callback(callback_query: dict):
     if len(parts) != 3 or parts[0] != "remind":
         return
     job_id, level = parts[1], parts[2]
+
+    if not _is_valid_uuid(job_id):
+        await telegram_service.edit_message_text(chat_id, message_id, "❌ Invalid job ID.")
+        return
 
     # Fetch the job row to get email details
     fetch_sql = f"SELECT * FROM public.job_entries WHERE id = '{job_id}'"
